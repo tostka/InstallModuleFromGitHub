@@ -3,7 +3,7 @@ function Install-ModuleFromGitHub {
     .SYNOPSIS
     Install-ModuleFromGitHub.ps1 - Adds cmdlets for direct installing mods from GitHub. Works similar to Install-Module. It streamlines the multi-step process of downloading the zip from GitHub, unblocking it, unzipping it and copying it to a well known module directory. It also checks for a ‘psd1’ file, cracks is open and uses the ModuleVersion to create a directory for it to copy the bits to.
     .NOTES
-    Version     : 1.6.1
+    Version     : 1.6.2
     Author      : Doug Finke
     Website     : https://github.com/dfinke/InstallModuleFromGitHub
     Twitter     : @dfinke / http://twitter.com/dfinke
@@ -17,6 +17,13 @@ function Install-ModuleFromGitHub {
     AddedWebsite: http://www.toddomation.com
     AddedTwitter: @tostka / http://twitter.com/tostka
     REVISIONS
+    * 10:58 AM 1/12/2024 1.6.2 add: expand error cap on invoke-restmehtod; reworked 
+        new-modulemanifest process, try/Catch test-ModuleManifest, push 
+        New-ModuleManifest rebuild into the catch (rather than just driving if missing 
+        ModuleVersion; should force rebuild on any test fail) 
+        Test existintg .psd1 key add, and append any keys in the extracted, into the new recreation 
+        Considered sticking ProjectURI, Tags, in the new, but new-MM throws up if they're $null (and pulling them out is a waste of space; auto-append will add them if they're present in extraced .psd1)
+        Added ValidateSet on scopes; trailing gmo -list on the install; expanded verbose support
     * 2:45 PM 1/11/2024 add: code to rebuild completely broken psd1 manifest (where inbound is incomplete/untested);
          add suitable echos for missing inbound params;
          trailing echo for install location ;
@@ -74,6 +81,10 @@ function Install-ModuleFromGitHub {
     .EXAMPLE
     PS> Install-ModuleFromGitHub -ProjectUri https://github.com/rossobianero/NupkgDownloader -Scope CurrentUser -verbose ;
     Install via ProjectUri into CurrentUser scope, with verbose output
+    .EXAMPLE
+    PS> Install-ModuleFromGitHub -ProjectUri https://github.com/rossobianero/NupkgDownloader -Scope CurrentUser -AssertVersion '1.2.3' -verbose ;
+    Install via ProjectUri into CurrentUser scope, with verbose output
+
     .LINK
     https://dfinke.github.io/powershell/2016/11/21/Quickly-Install-PowerShell-Modules-from-GitHub.html
     .LINK
@@ -140,27 +151,35 @@ function Install-ModuleFromGitHub {
                 $Exit = 0 ; $Retries = 2 ;
                 Do {
                     TRY{
-                        Invoke-RestMethod $url -OutFile $OutFile -Headers $headers -ErrorAction STOP
+                        Invoke-RestMethod $url -OutFile $OutFile -Headers $headers -ErrorAction STOP -ErrorVariable errIRM
                         $Exit = $Retries ;
                     } CATCH {
                         #$_.Exception.Message ;
                         $ErrTrapd=$Error[0]
                         $Exit ++ ;
-                        $smsg= "Try #: $($Exit)" ;
+                        $smsg = $vmsg = $null ; 
+                        $smsg += "Try #: $($Exit)" ;
 
                         if ($Exit -eq $Retries) {
                             $smsg += "Unable to exec cmd!" ;
                             throw $smsg ;
-                            break ; 
+                            BREAK ; 
                         } ;
+                        
                         if($ErrTrapd){
                             $smsg = "`n$(($ErrTrapd | fl * -Force|out-string).trim())" ;
                         } else { 
-                            $smsg = "`nfailed to download:$($url)!" ;
+                            $smsg += "`nfailed to download:$($url)!" ;
                         } ; 
-                        #if($GitHubRepo){$smsg += "`n(perhaps try with -ProjectUri parameter)" } ; 
-                        write-warning "$((get-date).ToString('HH:mm:ss')):$($smsg)" ;
-                        write-host "Retrying using alt url: $($url2)" ;
+                        if($errIRM){
+                            $smsg += "`nResponse.StatusCode:$($errIRM.ErrorRecord.Exception.Response.StatusCode)!" ;
+                            $smsg += "`nResponse.StatusCode number:$([int]$errIRM.ErrorRecord.Exception.Response.StatusCode)!" ;
+                            $vmsg = "`nResponse.Headers:`n$(($errIRM.ErrorRecord.Exception.Response.Headers -join ', '|out-string).trim())" ; 
+                            $vmsg += "`n$(($errIRM | fl * -Force|out-string).trim())" ;
+                        } ; 
+                        write-warning $smsg ;
+                        if($vmsg){ write-verbose $vmsg} ; 
+                        write-host -foregroundcolor yellow "Retrying using alt url:`n $($url2)" ;
                         $url = $url2 ; 
                     } ; 
                 } Until ($Exit -eq $Retries) ; 
@@ -174,8 +193,6 @@ function Install-ModuleFromGitHub {
                 # Pscx has a clashing Expand-Archive without the -dest param, module-qualify to the target module
                 Microsoft.PowerShell.Archive\Expand-Archive -Path $OutFile -DestinationPath $tmpDir -Force
                 
-
-
                 $unzippedArchive = get-childItem "$tmpDir"
                 Write-Debug "targetModule: $targetModule"
 
@@ -217,26 +234,69 @@ function Install-ModuleFromGitHub {
                 } 
 
                 $sourcePath = $unzippedArchive.FullName
-
+                
                 if($psd1) {
-                    # test, some mod psd1s don't have version spec'd
-                    if($ModuleVersion=(Get-Content -Raw $psd1.FullName | Invoke-Expression).ModuleVersion){
-                        write-verbose "detected ModuleVersion: $($ModuleVersion)" ; 
-                    } else { 
-                        #$defaultVersion = [version]$NewVersion = "{0}.{1}.{2}" -f 0, 5, 0
-                        if($AssertVersion){ 
-                            $defaultVersion = "$($AssertVersion.major).$($AssertVersion.minor).$($AssertVersion.Build)" ; 
-                        } else { $defaultVersion = '0.5.0' ; } ;
-                        write-host "No psd1.ModuleVersion found: Asserting arbitrary $($defaultVersion)" ; 
-                        #$psdinfo = test-modulemanifest -Path $psd1.FullName ;  # throws up if missing ModuleVersion, use import-psd
-                        $psdinfo = Import-PowerShellDataFile -Path $psd1.FullName ; 
-                        if(-not $psdinfo.ModuleVersion){
-                            #Update-ModuleManifest -Path $psd1.FullName -ModuleVersion $defaultVersion -verbose ; 
-                            # can't update if it's missing a key value, need to new-ModuleManifest constructed off of what's *in* the psd1
+                    # test, some mod psd1s don't have required ModuleVersion spec'd, fix on the fly...
+                    # better: run full test-ModuleManifest, trigger rebuild based on what it does have, if it won't pass for any reason:
+
+                    TRY {
+                        $psd1Profile = Test-ModuleManifest -path $psd1.fullname -errorVariable ttmm_Err -WarningVariable ttmm_Wrn -InformationVariable ttmm_Inf -ErrorAction STOP ;
+                    } CATCH {
+                        $ErrTrapd=$Error[0] ;
+                        if($ErrTrapd){
+                            $smsg = "`n$(($ErrTrapd | fl * -Force|out-string).trim())" ;
+                            write-warning $smsg ;
+                        } ; 
+                        if($ttmm_Err){
+                            $smsg = "`nFOUND `$ttmm_Err: test-ModuleManifest HAD ERRORS!" ;
+                            if ($logging) { Write-Log -LogContent $smsg -Path $logfile -useHost -Level WARN -Indent}
+                            else{ write-WARNING $smsg } ;
+                            foreach($errExcpt in $ttmm_Err.Exception){
+                                $smsg = "`n$($errExcpt)" ;
+                                write-WARNING $smsg  ;
+                            } ;
+                            
+                            <# Building a new intact ModuleManifest .psd1 file:
+                            Provisos: 
+                            - Update-ModuleManifest -Path $psd1.FullName -ModuleVersion $defaultVersion -verbose ; 
+                                => You can't update if existing is missing ModuleVersion: Need to new-ModuleManifest constructed off of what's *in* the psd1
+                            - Test-ModuleManifest likewise throws up if missing ModuleVersion, use Import-PowershellDataFile to pull in existing content
+                            
+                            # Req'd new-ModuleManifest parameters: Only ModuleVersion is explicitly required in the .psd1:
+
+                            [New-ModuleManifest (Microsoft.PowerShell.Core) - PowerShell | Microsoft Learn](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/new-modulemanifest?view=powershell-5.1)
+                            -ModuleVersion, isn't [a] required [parameter], but a ModuleVersion key is required in the manifest. If you omit this parameter, New-ModuleManifest creates a ModuleVersion key with a value of 1.0.
+                            If you are planning to publish your module in the PowerShell Gallery, the 
+                                manifest must contain values for certain properties. For more information, see 
+                                Required metadata for items published to the PowerShell Gallery in the Gallery documentation:
+                                [Creating and publishing an item - PowerShell | Microsoft Learn](https://learn.microsoft.com/en-us/powershell/gallery/how-to/publishing-packages/publishing-a-package?view=powershellget-3.x#required-metadata-for-items-published-to-the-powershell-gallery)
+                                
+                                => Odds are, if you're installing a 3rd party's github module, you aren't going to be PSG publishing it :'D So we'll skip populating the PSG-mandated metadata fields
+                                    If you are planning to publish your module in the PowerShell Gallery, the
+                                    manifest must contain values for certain properties. For more information, see
+                                    Required metadata for items published to the PowerShell Gallery in the Gallery documentation.
+                                        - ModuleName
+                                        - ModuleVersion
+                                        - Author
+                                        - Description
+                                        - ProjectURI
+                                        - Tags
+                            #>
+                            #if($ModuleVersion=(Get-Content -Raw $psd1.FullName | Invoke-Expression).ModuleVersion){ # nothing to parse if it's missing completely
+                            # pull what's in the existing in, for transplanting into new
+                            $psdinfo = Import-PowerShellDataFile -Path $psd1.FullName -EA STOP ; 
+                            if($psdinfo.ModuleVersion){
+                                write-verbose "detected a required ModuleVersion key: $($ModuleVersion)" ; 
+                            } else { 
+                                if($AssertVersion){ 
+                                    $defaultVersion = "$($AssertVersion.major).$($AssertVersion.minor).$($AssertVersion.Build)" ; 
+                                } else { $defaultVersion = '0.5.0' ; } ;
+                                write-host "No psd1.ModuleVersion found: Asserting arbitrary $($defaultVersion)" ; 
+                            } ; 
                             $pltNMM=[ordered]@{
                                 Path = $psd1.FullName ; 
                                 Copyright = $null ;
-                                Description = $null ;
+                                #Description = $null ;
                                 PrivateData = $null ;
                                 CompanyName = $null ;
                                 GUID = $null ;
@@ -247,11 +307,18 @@ function Install-ModuleFromGitHub {
                                 AliasesToExport = $null ;
                                 CmdletsToExport = $null ;
                                 ModuleVersion = $null ;
-                                ErrorAction = 'STOP' ;                                 
+                                #ProjectUri = $null ;
+                                #Tags = $null ;
+                                ErrorAction = 'STOP' ; 
+                                Verbose = $true ;                                
                             } ;
                             # loop out whatever's in there and assign to the splat:
                             $psdinfo.GetEnumerator() |foreach {
-                                $pltNMM[$_.key] = $_.value ; 
+                                if($pltNMM.contains($_.key)){
+                                    $pltNMM[$_.key] = $_.value 
+                                } else {
+                                    $pltNMM.add($_.key,$_.value ) ; 
+                                } 
                             }
                             # coerce a default ModuleVersion, if none spec'd
                             if($pltNMM.ModuleVersion -eq $null){$ModuleVersion = $pltNMM.ModuleVersion = $defaultVersion} ; 
@@ -259,7 +326,7 @@ function Install-ModuleFromGitHub {
                             write-host -foregroundcolor Yellow $smsg ;
                             TRY{
                                 new-ModuleManifest  @pltNMM
-                                # works, overwrites even sketchy half populated existing .psd1's with fully populated (or throws up with a fixable error)
+                                # overwrites even sketchy half populated existing .psd1's with fully populated (or throws up with a fixable error)
                             } CATCH {
                                 $ErrTrapd=$Error[0] ;
                                 $smsg = "`n$(($ErrTrapd | fl * -Force|out-string).trim())" ;
@@ -267,8 +334,12 @@ function Install-ModuleFromGitHub {
                                 throw $smsg ;
                                 break ;
                             } ; 
+                        } else {
+                            $smsg = "(no `$ttmm_Err: test-ModuleManifest had no errors)" ;
+                            write-verbose $smsg ;
                         } ; 
                     } ; 
+                
                     $dest = Join-Path -Path $dest -ChildPath $ModuleVersion
                     $null = New-Item -ItemType directory -Path $dest -Force
                     $sourcePath = $psd1.DirectoryName
@@ -276,18 +347,31 @@ function Install-ModuleFromGitHub {
                     $smsg = "Unable to locate a PSD1 file!:Get-ChildItem (Join-Path -Path $($tmpDir) -ChildPath $($unzippedArchive.Name)) -Include *.psd1 -Recurse" ; 
                     write-warning $smsg ;
                     throw $smsg ;
+                    Break ; 
                 } 
 
-
-
-                if ([System.Environment]::OSVersion.Platform -eq "Unix") {
-                    $null = Copy-Item "$(Join-Path -Path $unzippedArchive -ChildPath *)" $dest -Force -Recurse
-                } else {
-                    $null = Copy-Item "$sourcePath\*" $dest -Force -Recurse
-                }
+                TRY{
+                    if ([System.Environment]::OSVersion.Platform -eq "Unix") {
+                        $null = Copy-Item "$(Join-Path -Path $unzippedArchive -ChildPath *)" $dest -Force -Recurse -verbose:$($VerbosePreference -eq "Continue") 
+                    } else {
+                        $null = Copy-Item "$sourcePath\*" $dest -Force -Recurse -ErrorAction Stop -verbose:$($VerbosePreference -eq "Continue")
+                    }
+                } CATCH {
+                    $ErrTrapd=$Error[0] ;
+                    $smsg = "`n$(($ErrTrapd | fl * -Force|out-string).trim())" ;
+                    write-warning "$((get-date).ToString('HH:mm:ss')):$($smsg)" ;
+                } ; 
 
                 $smsg = "Newly created module installed to:`n$($dest)"
                 write-host -foregroundcolor green $smsg  ; 
+                TRY{
+                    $smsg = "get-module -name $($targetModuleName) -ListAvailable  `n$((get-module -name $targetModuleName -ListAvailable -erroraction STOP |out-string).trim())" ; 
+                    write-host -foregroundcolor green $smsg ;
+                } CATCH {
+                    $ErrTrapd=$Error[0] ;
+                    $smsg = "`n$(($ErrTrapd | fl * -Force|out-string).trim())" ;
+                    write-warning "$((get-date).ToString('HH:mm:ss')):$($smsg)" ;
+                } ; 
 
         } else {
             $smsg = "No -GitHubRepo specified!`nplease specify in username\reponame format" ; 
